@@ -3,16 +3,14 @@ package waitmap
 
 import (
 	"sync"
+	"sync/atomic"
 )
-
-// TODO use sync/atomic wherever possible
 
 // An entry in a WaitMap.
 type entry struct {
-	mutx *sync.Mutex
 	cond *sync.Cond
 	data interface{}
-	ok   bool
+	ok   uint32
 }
 
 type WaitMap struct {
@@ -41,28 +39,17 @@ func (m *WaitMap) Get(k interface{}) interface{} {
 	m.lock.Lock()
 	e, ok := m.ents[k]
 	if !ok {
-		mutx := new(sync.Mutex)
-		e = &entry{
-			mutx: mutx,
-			cond: sync.NewCond(mutx),
-			data: nil,
-			ok:   false,
-		}
+		e = new(entry)
+		e.cond = sync.NewCond(new(sync.Mutex))
 		m.ents[k] = e
 	}
 	m.lock.Unlock()
 
-	// If e.ok is true, e.data exists and can never cease to exist. We need
-	// this check to avoid using a nil e.mutx. We could also actually check
-	// e.mutx to see if it's nil, but this accomplishes the same thing and
-	// will be slightly faster on average (since we will often avoid
-	// unnecessarily messing with the mutex).
-	if e.ok {
-		return e.data
+	e.cond.L.Lock()
+	for atomic.LoadUint32(&e.ok) != 1 {
+		e.cond.Wait()
 	}
-	e.mutx.Lock()
-	e.cond.Wait()
-	e.mutx.Unlock()
+	e.cond.L.Unlock()
 	return e.data
 }
 
@@ -72,28 +59,23 @@ func (m *WaitMap) Set(k interface{}, v interface{}) bool {
 	m.lock.Lock()
 	e, ok := m.ents[k]
 	if !ok {
-		mutx := new(sync.Mutex)
-		e := &entry{
-			mutx: mutx,
-			cond: sync.NewCond(mutx),
-			data: v,
-			ok:   true,
-		}
+		e = new(entry)
+		e.cond = sync.NewCond(new(sync.Mutex))
+		e.data = v
+		e.ok = 1
 		m.ents[k] = e
 		m.lock.Unlock()
 		return true
 	}
-	if e.ok {
-		m.lock.Unlock()
+	m.lock.Unlock()
+
+	if atomic.CompareAndSwapUint32(&e.ok, 0, 1) {
+		e.data = v
+		e.cond.Broadcast()
+		return true
+	} else {
 		return false
 	}
-	e.mutx.Lock()
-	m.lock.Unlock()
-	e.data = v
-	e.ok = true
-	e.cond.Broadcast()
-	e.mutx.Unlock()
-	return true
 }
 
 // Returns true if k is a key in the map.
@@ -104,5 +86,5 @@ func (m *WaitMap) Check(k interface{}) bool {
 	if !ok {
 		return false
 	}
-	return e.ok
+	return atomic.LoadUint32(&e.ok) == 1
 }
